@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
 	"time"
 )
@@ -66,8 +68,14 @@ func parseConfig() (Config, error) {
 	}, nil
 }
 
-func fetchMovie(client *http.Client, id int) (Movie, error) {
-	resp, err := client.Get(movieURL(id))
+func fetchMovie(ctx context.Context, timeout time.Duration, client *http.Client, id int) (Movie, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, movieURL(id), nil)
+	if err != nil {
+		return Movie{}, fmt.Errorf("create request for movie %d: %w", id, err)
+	}
+	resp, err := client.Do(request)
 	if err != nil {
 		return Movie{}, fmt.Errorf("fetch movie %d: %w", id, err)
 	}
@@ -88,22 +96,32 @@ func movieURL(id int) string {
 	return fmt.Sprintf(movieURLPattern, id)
 }
 
-func worker(client *http.Client, jobs <-chan int, results chan<- Result) {
+func worker(ctx context.Context, client *http.Client, timeout time.Duration, jobs <-chan int, results chan<- Result) {
 	for id := range jobs {
-		movie, err := fetchMovie(client, id)
-		results <- Result{ID: id, Movie: movie, Err: err}
+		movie, err := fetchMovie(ctx, timeout, client, id)
+		select {
+		case <-ctx.Done():
+			return
+		case results <- Result{ID: id, Movie: movie, Err: err}:
+		}
 	}
 }
 
-func produceJobs(from, to int, jobs chan<- int) {
+func produceJobs(ctx context.Context, from, to int, jobs chan<- int) {
 	defer close(jobs)
 	for id := from; id <= to; id++ {
-		jobs <- id
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- id:
+		}
 	}
 }
 
 func startWorkers(
+	ctx context.Context,
 	count int,
+	timeout time.Duration,
 	client *http.Client,
 	jobs <-chan int,
 	results chan<- Result,
@@ -113,7 +131,7 @@ func startWorkers(
 	for i := 0; i < count; i++ {
 		go func() {
 			defer wg.Done()
-			worker(client, jobs, results)
+			worker(ctx, client, timeout, jobs, results)
 		}()
 	}
 }
@@ -129,14 +147,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	client := &http.Client{
-		Timeout: config.Timeout,
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	client := &http.Client{}
 	jobs := make(chan int)
 	results := make(chan Result)
 	var wg sync.WaitGroup
-	startWorkers(config.Workers, client, jobs, results, &wg)
-	go produceJobs(config.From, config.To, jobs)
+	startWorkers(ctx, config.Workers, config.Timeout, client, jobs, results, &wg)
+	go produceJobs(ctx, config.From, config.To, jobs)
 	go closeResultsAfterWorkers(&wg, results)
 	for result := range results {
 		if result.Err != nil {
